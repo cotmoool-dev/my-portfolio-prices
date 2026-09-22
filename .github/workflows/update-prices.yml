@@ -2,8 +2,15 @@ name: Update prices.json
 
 on:
   schedule:
-    # cron은 UTC 기준입니다. KST 08:30 = UTC(전날) 23:30.
-    # 화~토 KST 08:30 실행 = UTC 기준 일~금 23:30 실행이므로 요일은 0-4(일~목)로 지정합니다.
+    # cron은 UTC 기준입니다(KST = UTC + 9시간).
+    #
+    # ① 장 마감 후 당일 종가 수집 — KST 평일 18:00 = UTC 평일 09:00.
+    #    국내 증시는 15:30에 마감되므로 2시간 반 여유를 두고 정식 종가를 받습니다.
+    #    (장중에 수동 실행하면 '그 시각의 체결가'가 담겨 종가와 다를 수 있습니다.)
+    - cron: "0 9 * * 1-5"
+    #
+    # ② 다음 날 아침 예비 실행 — KST 08:30 = UTC 전날 23:30.
+    #    UTC 일~목(0-4)이 KST 월~금 아침에 해당합니다. ①이 실패했을 때의 안전망입니다.
     - cron: "30 23 * * 0-4"
   workflow_dispatch: {}   # 필요할 때 Actions 탭에서 수동 실행
 
@@ -61,4 +68,3 @@ jobs:
             git commit -m "chore: update prices.json ($(date -u +'%Y-%m-%d'))"
             git push
           fi
-
