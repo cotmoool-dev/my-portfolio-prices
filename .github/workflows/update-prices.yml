@@ -17,7 +17,9 @@ concurrency:
 jobs:
   update-prices:
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # 무료 한도(개별 job 6시간)에 비하면 넉넉히 여유 있게 설정
+    # 국내 전종목(코스피+코스닥, 약 2,500여 개)까지 yfinance로 받다 보니 기존 30분보다
+    # 여유가 필요해서 45분으로 늘렸습니다. 무료 한도(개별 job 6시간)에는 여전히 넉넉합니다.
+    timeout-minutes: 45
 
     steps:
       - name: 저장소 체크아웃
@@ -31,7 +33,10 @@ jobs:
       - name: 의존 패키지 설치
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pykrx requests
+          # ⚠️ 2026-09-22: pykrx가 KRX 로그인 인증을 요구하도록 바뀌어서(계정 없이는
+          # 전종목 시세 조회 자체가 막힘) 제거했습니다. 대신 로그인이 필요 없는
+          # FinanceDataReader(종목코드 목록)+yfinance(종가) 조합으로 바꿨습니다.
+          pip install yfinance finance-datareader requests
 
       - name: 시세 수집 실행
         env:
