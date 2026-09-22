@@ -47,10 +47,18 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- prices.json; then
+          ls -l prices.json
+          # ⚠️ 2026-09-22 수정: 이전 버전은 `git diff --quiet -- prices.json`으로 변경 여부를
+          # 판단했는데, git diff는 "추적 중인 파일"만 봅니다. prices.json은 저장소에 한 번도
+          # 커밋된 적 없는 새 파일(untracked)이라 diff가 항상 비어 있었고, 그래서 매번
+          # "변경 없음"으로 빠져서 영원히 커밋되지 않았습니다(수집은 성공했는데 결과가
+          # 버려짐). 먼저 git add로 스테이징한 뒤 HEAD와 비교하도록 바꿉니다 —
+          # 새 파일이든 수정된 파일이든 올바르게 감지됩니다.
+          git add prices.json
+          if git diff --cached --quiet -- prices.json; then
             echo "prices.json 변경 없음 — 커밋 생략"
           else
-            git add prices.json
             git commit -m "chore: update prices.json ($(date -u +'%Y-%m-%d'))"
             git push
           fi
+
