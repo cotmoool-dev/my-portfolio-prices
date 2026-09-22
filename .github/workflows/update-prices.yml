@@ -1,0 +1,51 @@
+name: Update prices.json
+
+on:
+  schedule:
+    # cron은 UTC 기준입니다. KST 08:30 = UTC(전날) 23:30.
+    # 화~토 KST 08:30 실행 = UTC 기준 일~금 23:30 실행이므로 요일은 0-4(일~목)로 지정합니다.
+    - cron: "30 23 * * 0-4"
+  workflow_dispatch: {}   # 필요할 때 Actions 탭에서 수동 실행
+
+permissions:
+  contents: write   # prices.json을 커밋·푸시하기 위해 필요
+
+concurrency:
+  group: update-prices
+  cancel-in-progress: true
+
+jobs:
+  update-prices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # 무료 한도(개별 job 6시간)에 비하면 넉넉히 여유 있게 설정
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pykrx requests
+
+      - name: 시세 수집 실행
+        env:
+          GOLD_API_KEY: ${{ secrets.GOLD_API_KEY }}
+        run: python fetch_prices.py
+
+      - name: prices.json 변경사항 커밋 & 푸시
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- prices.json; then
+            echo "prices.json 변경 없음 — 커밋 생략"
+          else
+            git add prices.json
+            git commit -m "chore: update prices.json ($(date -u +'%Y-%m-%d'))"
+            git push
+          fi
