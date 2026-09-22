@@ -128,18 +128,25 @@ def load_kr_universe() -> dict:
         return {}
 
     universe = {}
-    for market, suffix in (("KOSPI", "KS"), ("KOSDAQ", "KQ")):
+    # ⚠️ 2026-09-22 추가: "KOSPI"/"KOSDAQ" 목록에는 '기업'만 들어 있고 ETF는 빠져 있습니다.
+    # 그래서 국내 상장 ETF(예: 238720 ACE 일본Nikkei225, 395270 등)가 유니버스에 없어
+    # 앱에서 조회되지 않았습니다. "ETF/KR" 목록을 함께 넣어 해결합니다.
+    # 국내 ETF는 모두 유가증권시장 소속이라 yfinance 접미사는 .KS 입니다(238720.KS 확인).
+    for market, suffix in (("KOSPI", "KS"), ("KOSDAQ", "KQ"), ("ETF/KR", "KS")):
         try:
             df = fdr.StockListing(market)
             code_col = "Code" if "Code" in df.columns else "Symbol"
+            added = 0
             for code in df[code_col]:
                 code = str(code).strip().zfill(6)
-                if code:
+                if code and code not in universe:   # 코드는 시장 간 겹치지 않지만 방어적으로
                     universe[code] = suffix
+                    added += 1
+            print(f"[국내주식] {market}: {added}개")
         except Exception as e:
-            print(f"[국내주식] {market} 종목 목록 조회 실패: {e}", file=sys.stderr)
+            print(f"[국내주식] {market} 목록 조회 실패(이 시장만 건너뜀): {e}", file=sys.stderr)
 
-    print(f"[국내주식] FinanceDataReader에서 {len(universe)}개 종목 코드 로드(코스피+코스닥)")
+    print(f"[국내주식] 총 {len(universe)}개 종목 코드 로드(기업 + 국내 상장 ETF)")
     return universe
 
 
@@ -229,6 +236,10 @@ GOLD_ENDPOINT_CANDIDATES = [
 # 종가로 쓸 필드 후보들(맞는 게 없으면 실제 키 목록을 로그로 출력합니다)
 GOLD_PRICE_FIELD_CANDIDATES = ["clpr", "closePrc", "wghtAvgPrc", "price", "clsprc"]
 
+# 한 번의 요청을 기다리는 시간(초). 이 API는 응답이 오면 즉시 오고, 안 될 때는 아예 연결이
+# 안 되는 양상이라 오래 기다릴 이유가 없습니다. 예비 경로가 있으니 짧게 끊습니다.
+GOLD_TIMEOUT_SEC = 8
+
 
 def _mask_key(text: str, api_key: str) -> str:
     """로그에 인증키가 그대로 찍히지 않도록 가립니다."""
@@ -280,12 +291,15 @@ def fetch_gold_price_per_g(base_date: dt.date, max_lookback_days: int = 10) -> i
         }
 
         endpoints = [working_endpoint] if working_endpoint else GOLD_ENDPOINT_CANDIDATES
+        reached_server = False   # 이번 날짜에 서버와 한 번이라도 통신이 됐는지(HTTP 응답을 받았는지)
         for url in endpoints:
             try:
-                res = requests.get(url, params=params, timeout=15)
+                res = requests.get(url, params=params, timeout=GOLD_TIMEOUT_SEC)
             except Exception as e:
+                # 연결 자체가 안 된 경우(타임아웃·DNS·차단). 응답을 못 받았으므로 reached_server는 그대로 False.
                 print(f"[금현물] 요청 자체 실패 {url}: {e}", file=sys.stderr)
                 continue
+            reached_server = True
 
             snippet = _mask_key(res.text[:300].replace("\n", " "), api_key)
             if working_endpoint is None:
@@ -321,6 +335,14 @@ def fetch_gold_price_per_g(base_date: dt.date, max_lookback_days: int = 10) -> i
                 f"(항목 전체: {_mask_key(str(item)[:500], api_key)})",
                 file=sys.stderr,
             )
+            return None
+
+        # 서버에 아예 닿지 못한 경우엔 날짜를 거슬러 올라가도 결과가 같습니다(휴장일 문제가 아니라
+        # 네트워크·차단 문제이므로). 남은 9일치를 15초씩 기다리며 헛돌면 실행 시간만 몇 분씩
+        # 낭비되기 때문에, 여기서 바로 포기하고 예비 경로(국제 금시세 환산)로 넘어갑니다.
+        if not reached_server:
+            print("[금현물] 서버에 연결되지 않습니다(타임아웃·차단 등). 날짜를 더 거슬러 올라가도 "
+                  "같은 결과이므로 여기서 중단하고 예비 경로로 넘어갑니다.", file=sys.stderr)
             return None
 
         # 이 날짜로는 데이터를 못 얻었으니 하루 전으로(주말·공휴일 대응)
