@@ -44,45 +44,124 @@ def today_kst() -> dt.date:
 
 
 # ---------------------------------------------------------------------------
-# 1) 국내주식: pykrx로 코스피+코스닥 전종목 종가를 한 번에 수집
+# 공용: yfinance 종가 일괄 다운로드 헬퍼 (국내주식/해외주식 양쪽에서 재사용)
 # ---------------------------------------------------------------------------
-def fetch_kr_close_prices(base_date: dt.date, max_lookback_days: int = 10) -> dict:
+# ⚠️ 2026-09-22 변경: 국내주식 수집에 쓰던 pykrx가 "KRX 로그인 실패: KRX_ID 또는
+# KRX_PW 환경 변수가 설정되지 않았습니다" 에러로 완전히 막혔습니다. 2026년 9월경
+# pykrx가 KRX 정식 인증을 요구하도록 바뀐 것으로 보이며(커뮤니티 사례:
+# kwondoyun07/K-PaperTrade #44), 로그인 계정을 새로 만들어 비밀정보로 관리하는 대신
+# 아예 pykrx 의존을 없앴습니다.
+#
+# 대체 방식: 로그인이 필요 없는 FinanceDataReader로 "코스피+코스닥 전종목 코드
+# 목록"만 받아오고(가격 정보는 없음), 실제 종가는 이미 검증된 해외주식용 yfinance
+# 일괄 다운로드 로직을 그대로 재사용해서 받습니다(종목코드에 .KS/.KQ 접미사만 붙이면
+# yfinance가 국내 종목도 그대로 조회해 줍니다).
+def _download_close_chunk(tickers: list, chunk_size: int = 100, retries: int = 1) -> dict:
     """
-    pykrx.stock.get_market_ohlcv_by_ticker(날짜, market="ALL")를 쓰면
-    코스피+코스닥 전종목의 OHLCV를 종목 하나하나 호출하지 않고 한 번에 가져올 수 있습니다.
-    주말·공휴일에는 빈 데이터가 오므로, 데이터가 나올 때까지 하루씩 과거로 이동합니다.
+    yfinance로 티커 목록의 최근 종가를 청크 단위로 받아옵니다. 국내주식(.KS/.KQ 접미사)과
+    해외주식(원본 티커) 양쪽에서 공용으로 씁니다. 티커를 한 번에 너무 많이 넣으면(수백~수천 개)
+    일부가 누락되는 경우가 있어서 chunk_size 단위로 나눠 요청하고, 청크 하나가 실패하면
+    가볍게 재시도한 뒤 그래도 안 되면 그 청크만 건너뜁니다(전체 스크립트는 죽지 않도록).
     """
     try:
-        from pykrx import stock
+        import yfinance as yf
     except Exception as e:
-        print(f"[국내주식] pykrx import 실패, 이번 회차는 건너뜁니다: {e}", file=sys.stderr)
+        print(f"[시세수집] yfinance import 실패: {e}", file=sys.stderr)
         return {}
 
-    d = base_date
-    for _ in range(max_lookback_days):
-        ymd = d.strftime("%Y%m%d")
+    result = {}
+    chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+    for idx, chunk in enumerate(chunks, start=1):
+        df = None
+        for attempt in range(1 + retries):
+            try:
+                df = yf.download(
+                    tickers=chunk,
+                    period="5d",          # 주말·공휴일 대비 여유 있게 최근 5거래일
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=False,
+                    threads=True,
+                    progress=False,
+                )
+                break
+            except Exception as e:
+                if attempt < retries:
+                    print(f"[시세수집] {idx}/{len(chunks)} 청크 다운로드 실패, 재시도합니다: {e}", file=sys.stderr)
+                    time.sleep(2)
+                else:
+                    print(f"[시세수집] {idx}/{len(chunks)} 청크 다운로드 최종 실패, 건너뜀: {e}", file=sys.stderr)
+
+        if df is None:
+            continue
+
+        for t in chunk:
+            try:
+                if len(chunk) == 1:
+                    close_series = df["Close"]
+                else:
+                    close_series = df[t]["Close"]
+                close_series = close_series.dropna()
+                if not close_series.empty:
+                    result[t] = float(close_series.iloc[-1])
+            except Exception:
+                continue  # 상장폐지·티커 오류 등 개별 실패는 건너뛰고 계속 진행
+        time.sleep(1)  # 청크 사이 살짝 쉬어서 과도한 연속 요청 방지
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 1) 국내주식: FinanceDataReader(종목코드 목록) + yfinance(.KS/.KQ 종가)
+# ---------------------------------------------------------------------------
+def load_kr_universe() -> dict:
+    """
+    코스피+코스닥 전종목 코드를 FinanceDataReader로 가져옵니다. 로그인/인증이 필요 없고,
+    Symbol(종목코드)·Name만 제공하므로 가격은 여기서 얻을 수 없습니다 — 아래
+    fetch_kr_close_prices()에서 yfinance로 따로 받습니다.
+    반환값: {"005930": "KS", "247540": "KQ", ...} (종목코드 -> yfinance 접미사)
+    """
+    try:
+        import FinanceDataReader as fdr
+    except Exception as e:
+        print(f"[국내주식] FinanceDataReader import 실패, 이번 회차는 건너뜁니다: {e}", file=sys.stderr)
+        return {}
+
+    universe = {}
+    for market, suffix in (("KOSPI", "KS"), ("KOSDAQ", "KQ")):
         try:
-            df = stock.get_market_ohlcv_by_ticker(ymd, market="ALL")
+            df = fdr.StockListing(market)
+            code_col = "Code" if "Code" in df.columns else "Symbol"
+            for code in df[code_col]:
+                code = str(code).strip().zfill(6)
+                if code:
+                    universe[code] = suffix
         except Exception as e:
-            print(f"[국내주식] {ymd} 조회 실패({e}), 하루 전으로 재시도", file=sys.stderr)
-            df = None
+            print(f"[국내주식] {market} 종목 목록 조회 실패: {e}", file=sys.stderr)
 
-        if df is not None and not df.empty and "종가" in df.columns:
-            result = {}
-            for code, row in df.iterrows():
-                try:
-                    close = row["종가"]
-                    if close and int(close) > 0:
-                        result[str(code)] = int(close)
-                except Exception:
-                    continue  # 개별 종목 파싱 실패는 건너뛰고 계속 진행
-            print(f"[국내주식] 기준일 {ymd} · {len(result)}개 종목 수집")
-            return result
+    print(f"[국내주식] FinanceDataReader에서 {len(universe)}개 종목 코드 로드(코스피+코스닥)")
+    return universe
 
-        d -= dt.timedelta(days=1)
 
-    print("[국내주식] 최근 영업일 데이터를 찾지 못했습니다. 빈 결과로 처리합니다.", file=sys.stderr)
-    return {}
+def fetch_kr_close_prices(kr_universe: dict, chunk_size: int = 100) -> dict:
+    """
+    kr_universe(종목코드 -> "KS"/"KQ")에 접미사를 붙여 yfinance 티커(예: "005930.KS")로
+    바꾼 뒤 해외주식과 같은 방식으로 일괄 다운로드하고, 결과를 다시 순수 6자리 종목코드
+    기준으로 되돌립니다.
+    """
+    if not kr_universe:
+        return {}
+
+    yf_tickers = [f"{code}.{suffix}" for code, suffix in kr_universe.items()]
+    raw = _download_close_chunk(yf_tickers, chunk_size=chunk_size, retries=1)
+
+    result = {}
+    for yf_ticker, price in raw.items():
+        code = yf_ticker.split(".")[0]
+        result[code] = price
+
+    print(f"[국내주식] {len(result)}/{len(kr_universe)}개 종목 수집 성공")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -100,47 +179,7 @@ def load_us_universe() -> list:
 
 
 def fetch_us_close_prices(tickers: list, chunk_size: int = 100) -> dict:
-    """
-    yfinance는 티커를 한 번에 너무 많이 넣으면(수백 개) 일부가 누락되는 경우가 있어서,
-    100개 단위로 나눠서 요청합니다(속도-안정성 절충). 실패한 청크는 건너뛰고 계속 진행합니다.
-    """
-    try:
-        import yfinance as yf
-        import pandas as pd
-    except Exception as e:
-        print(f"[해외주식] yfinance import 실패, 이번 회차는 건너뜁니다: {e}", file=sys.stderr)
-        return {}
-
-    result = {}
-    chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
-    for idx, chunk in enumerate(chunks, start=1):
-        try:
-            df = yf.download(
-                tickers=chunk,
-                period="5d",          # 주말·공휴일 대비 여유 있게 최근 5거래일
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                threads=True,
-                progress=False,
-            )
-        except Exception as e:
-            print(f"[해외주식] {idx}/{len(chunks)} 청크 다운로드 실패, 건너뜀: {e}", file=sys.stderr)
-            continue
-
-        for t in chunk:
-            try:
-                if len(chunk) == 1:
-                    close_series = df["Close"]
-                else:
-                    close_series = df[t]["Close"]
-                close_series = close_series.dropna()
-                if not close_series.empty:
-                    result[t] = float(close_series.iloc[-1])
-            except Exception:
-                continue  # 상장폐지·티커 오류 등 개별 실패는 건너뛰고 계속 진행
-        time.sleep(1)  # 청크 사이 살짝 쉬어서 과도한 연속 요청 방지
-
+    result = _download_close_chunk(tickers, chunk_size=chunk_size, retries=1)
     print(f"[해외주식] {len(result)}/{len(tickers)}개 티커 수집 성공")
     return result
 
@@ -324,7 +363,8 @@ def main():
     base_date = today_kst()
     print(f"=== 시세 수집 시작: 기준일 {base_date.isoformat()} (KST) ===")
 
-    kr_prices = fetch_kr_close_prices(base_date)
+    kr_universe = load_kr_universe()
+    kr_prices = fetch_kr_close_prices(kr_universe) if kr_universe else {}
 
     us_tickers = load_us_universe()
     us_prices = fetch_us_close_prices(us_tickers) if us_tickers else {}
